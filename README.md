@@ -1,3 +1,5 @@
+TARA is a program that follows the ARENA curriculum
+
 # Install Instructions
 
 1) Close the repo
