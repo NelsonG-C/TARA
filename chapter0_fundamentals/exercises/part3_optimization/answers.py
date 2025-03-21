@@ -87,35 +87,50 @@ device = t.device("mps" if t.backends.mps.is_available() else "cuda" if t.cuda.i
 MAIN = __name__ == "__main__"
 
 #%%
-def get_cifar() -> tuple[datasets.CIFAR10, datasets.CIFAR10]:
-    """Returns CIFAR-10 train and test sets."""
-    cifar_trainset = datasets.CIFAR10(exercises_dir / "data", train=True, download=True, transform=IMAGENET_TRANSFORM)
-    cifar_testset = datasets.CIFAR10(exercises_dir / "data", train=False, download=True, transform=IMAGENET_TRANSFORM)
-    return cifar_trainset, cifar_testset
+def pathological_curve_loss(x: Tensor, y: Tensor):
+    # Example of a pathological curvature. There are many more possible, feel free to experiment here!
+    x_loss = t.tanh(x) ** 2 + 0.01 * t.abs(x)
+    y_loss = t.sigmoid(y)
+    return x_loss + y_loss
 
 
-IMAGE_SIZE = 224
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+plot_fn(pathological_curve_loss, min_points=[(0, "y_min")])
+# %%
+def opt_fn_with_sgd(
+    fn: Callable, xy: Float[Tensor, "2"], lr=0.001, momentum=0.98, n_iters: int = 100
+) -> Float[Tensor, "n_iters 2"]:
+    """
+    Optimize the a given function starting from the specified point.
 
-IMAGENET_TRANSFORM = transforms.Compose(
-    [
-        transforms.ToTensor(),
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ]
-)
+    xy: shape (2,). The (x, y) starting point.
+    n_iters: number of steps.
+    lr, momentum: parameters passed to the torch.optim.SGD optimizer.
+
+    Return: (n_iters+1, 2). The (x, y) values, from initial values pre-optimization to values after step `n_iters`.
+    """
+    # Make sure tensor has requires_grad=True, otherwise it can't be optimized (more on this tomorrow!)
+    assert xy.requires_grad
+    xy_list = []
+    for n in range(n_iters):
+        xyres = torch.optim.SGD((xy,), lr=lr, momentum=momentum)
+        print('xy', xyres)
+        xy_list.append(xyres.detach().clone())
+    
+    return xy_list
 
 
-cifar_trainset, cifar_testset = get_cifar()
+points = []
 
-imshow(
-    cifar_trainset.data[:15],
-    facet_col=0,
-    facet_col_wrap=5,
-    facet_labels=[cifar_trainset.classes[i] for i in cifar_trainset.targets[:15]],
-    title="CIFAR-10 images",
-    height=600,
-    width=1000,
-)
+optimizer_list = [
+    (optim.SGD, {"lr": 0.1, "momentum": 0.0}),
+    (optim.SGD, {"lr": 0.02, "momentum": 0.99}),
+]
+
+for optimizer_class, params in optimizer_list:
+    xy = t.tensor([2.5, 2.5], requires_grad=True)
+    xys = opt_fn_with_sgd(pathological_curve_loss, xy=xy, lr=params["lr"], momentum=params["momentum"])
+    points.append((xys, optimizer_class, params))
+    print(f"{params=}, last point={xys[-1]}")
+
+plot_fn_with_points(pathological_curve_loss, points=points, min_points=[(0, "y_min")])
 # %%
