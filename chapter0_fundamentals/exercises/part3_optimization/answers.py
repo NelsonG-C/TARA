@@ -110,19 +110,21 @@ def opt_fn_with_sgd(
     """
     # Make sure tensor has requires_grad=True, otherwise it can't be optimized (more on this tomorrow!)
     assert xy.requires_grad
-    xy_list = []
+    xy_list = [xy.detach().clone()]
+    optimiser = torch.optim.SGD((xy,), lr=lr, momentum=momentum)
     for n in range(n_iters):
-        xyres = torch.optim.SGD((xy,), lr=lr, momentum=momentum)
-        print('xy', xyres)
-        xy_list.append(xyres.detach().clone())
+        fn(xy[0], xy[1]).backward()
+        optimiser.step()
+        optimiser.zero_grad()
+        xy_list.append(xy.detach().clone())
     
-    return xy_list
+    return t.stack(xy_list)
 
 
 points = []
 
 optimizer_list = [
-    (optim.SGD, {"lr": 0.1, "momentum": 0.0}),
+    (optim.SGD, {"lr": 0.04, "momentum": 0.99}),
     (optim.SGD, {"lr": 0.02, "momentum": 0.99}),
 ]
 
