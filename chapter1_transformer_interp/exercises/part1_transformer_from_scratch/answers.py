@@ -10,10 +10,10 @@ repo = "ARENA_3.0"
 branch = "main"
 
 # Install dependencies
-try:
-    import transformer_lens
-except:
-    %pip install transformer_lens==2.11.0 einops jaxtyping git+https://github.com/callummcdougall/CircuitsVis.git#subdirectory=python
+# try:
+#     import transformer_lens
+# except:
+#     %pip install transformer_lens==2.11.0 einops jaxtyping git+https://github.com/callummcdougall/CircuitsVis.git#subdirectory=python
 
 # Get root directory, handling 3 different cases: (1) Colab, (2) notebook not in ARENA repo, (3) notebook in ARENA repo
 root = (
@@ -23,18 +23,6 @@ root = (
     if repo not in os.getcwd()
     else str(next(p for p in Path.cwd().parents if p.name == repo))
 )
-
-if Path(root).exists() and not Path(f"{root}/{chapter}").exists():
-    if not IN_COLAB:
-        !sudo apt-get install unzip
-        %pip install jupyter ipython --upgrade
-
-    if not os.path.exists(f"{root}/{chapter}"):
-        !wget -P {root} https://github.com/callummcdougall/ARENA_3.0/archive/refs/heads/{branch}.zip
-        !unzip {root}/{branch}.zip '{repo}-{branch}/{chapter}/exercises/*' -d {root}
-        !mv {root}/{repo}-{branch}/{chapter} {root}/{chapter}
-        !rm {root}/{branch}.zip
-        !rmdir {root}/ARENA_3.0-{branch}
 
 
 if f"{root}/{chapter}/exercises" not in sys.path:
@@ -476,7 +464,7 @@ class TransformerTrainingArgs:
     max_steps_per_epoch = 200
     lr = 1e-3
     weight_decay = 1e-2
-    wandb_project: str | None = "day1-demotransformer"
+    wandb_project: str | None = "demotransformer-test-2apr"
     wandb_name: str | None = None
 
 
@@ -503,4 +491,296 @@ train_loader = DataLoader(
 test_loader = DataLoader(
     dataset_dict["test"], batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True
 )
+# %%
+class TransformerTrainer:
+    def __init__(self, args: TransformerTrainingArgs, model: DemoTransformer):
+        super().__init__()
+        self.model = model
+        self.args = args
+
+        self.optimizer = t.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        self.step = 0
+
+        self.train_loader = DataLoader(
+            dataset_dict["train"], batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
+        )
+        self.test_loader = DataLoader(
+            dataset_dict["test"], batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True
+        )
+
+    def training_step(self, batch: dict[str, Int[Tensor, "batch seq"]]) -> Float[Tensor, ""]:
+        """
+        Calculates the loss on the tokens in the batch, performs a gradient update step, and logs the loss.
+
+        Remember that `batch` is a dictionary with the single key 'tokens'.
+        """
+        tokens = batch["tokens"].to(device)
+        loss = -get_log_probs(tokens).mean()
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.step += 1
+
+    @t.inference_mode()
+    def evaluate(self) -> float:
+        """
+        Evaluate the model on the test set and return the accuracy.
+        """
+        self.model.eval()
+        total_correct, total_samples = 0, 0
+        for i, batch in tqdm(enumerate(self.test_loader), desc="Evaluating"):
+            tokens = batch["tokens"].to(device)
+            logits = self.model(tokens)[:, :-1]
+            predicted_tokens = logits.argmax(dim=-1)
+            total_correct += (predicted_tokens == tokens[:, 1:]).sum().item()
+            total_samples += tokens.size(0) * (tokens.size(1) - 1)
+        
+        accuracy = total_correct / total_samples
+        wandb.log({"accuracy": accuracy}, step=self.step)
+        return accuracy
+
+    def train(self):
+        """
+        Trains the model, for `self.args.epochs` epochs. Also handles wandb initialisation, and early stopping
+        for each epoch at `self.args.max_steps_per_epoch` steps.
+        """
+        wandb.init(project=self.args.wandb_project, name=self.args.wandb_name, config=self.args)
+        accuracy = np.nan
+
+        progress_bar = tqdm(total=self.args.max_steps_per_epoch * self.args.epochs)
+
+        for epoch in range(self.args.epochs):
+            for i, batch in enumerate(self.train_loader):
+                loss = self.training_step(batch)
+                progress_bar.update()
+                progress_bar.set_description(f"Epoch {epoch+1}, loss: {loss:.3f}, accuracy: {accuracy:.3f}")
+                if i >= self.args.max_steps_per_epoch:
+                    break
+
+            accuracy = self.evaluate()
+
+        wandb.finish()
+
+
+# See the full run here: https://api.wandb.ai/links/callum-mcdougall/4xtin05h
+# %%
+class TransformerSampler:
+    def __init__(self, model: DemoTransformer, tokenizer: GPT2TokenizerFast):
+        self.model = model
+        self.cfg = model.cfg
+        self.tokenizer = tokenizer
+
+    @t.inference_mode()
+    def sample(self, prompt: str, max_tokens_generated=100, verbose=False, **kwargs) -> str:
+        """
+        Returns a string of autoregressively generated text, starting from the prompt.
+
+        Sampling terminates at max_tokens_generated, or when the model generates an end-of-sequence token. kwargs are
+        passed to sample_next_token, to give detailed instructions on how new tokens are chosen.
+        """
+        self.model.eval()
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(device)[0]
+
+        for i in range(max_tokens_generated):
+            logits = self.model(input_ids[None, -self.cfg.n_ctx :])
+            logits_final = logits[0, -1]
+            token = t.tensor([TransformerSampler.sample_next_token(input_ids, logits_final, **kwargs)], device=device)
+            input_ids = t.cat([input_ids, token], dim=-1)
+            if verbose:
+                print(self.tokenizer.decode(input_ids), end="\r")
+                # If our new token was the end-of-text token, stop
+                if next_token == getattr(self.tokenizer, "eos_token_id", None):
+                    break
+        
+        return self.tokenizer.decode(input_ids)
+
+    @staticmethod
+    def sample_next_token(
+        input_ids: Int[Tensor, "seq_len"],
+        logits: Float[Tensor, "d_vocab"],
+        temperature=1.0,
+        top_k=0,
+        top_p=0.0,
+        frequency_penalty=0.0,
+        seed=None,
+    ) -> int:
+        assert input_ids.ndim == 1, "input_ids should be a 1D sequence of token ids"
+        assert temperature >= 0, "Temperature should be non-negative"
+        assert 0 <= top_p <= 1.0, "Top-p must be a probability"
+        assert 0 <= top_k, "Top-k must be non-negative"
+        assert not (top_p != 0 and top_k != 0), "At most one of top-p and top-k supported"
+
+        # Set random seeds for reproducibility
+        if seed is not None:
+            t.manual_seed(seed)
+            np.random.seed(seed)
+
+        # Apply all the specialized sampling methods
+        if temperature == 0:
+            return TransformerSampler.greedy_search(logits)
+        elif temperature != 1.0:
+            logits = TransformerSampler.apply_temperature(logits, temperature)
+        if frequency_penalty != 0.0:
+            logits = TransformerSampler.apply_frequency_penalty(input_ids, logits, frequency_penalty)
+        if top_k > 0:
+            return TransformerSampler.sample_top_k(logits, top_k)
+        if top_p > 0.0:
+            return TransformerSampler.sample_top_p(logits, top_p)
+        return TransformerSampler.sample_basic(logits)
+
+    @staticmethod
+    def greedy_search(logits: Float[Tensor, "d_vocab"]) -> int:
+        """
+        Returns the most likely token (as an int).
+        """
+        return t.argmax(logits, dim=-1)
+
+    @staticmethod
+    def apply_temperature(logits: Float[Tensor, "d_vocab"], temperature: float) -> Float[Tensor, "d_vocab"]:
+        """
+        Applies temperature scaling to the logits.
+        """
+        return logits / temperature
+
+    @staticmethod
+    def apply_frequency_penalty(
+        input_ids: Int[Tensor, "seq_len"], logits: Float[Tensor, "d_vocab"], freq_penalty: float
+    ) -> Float[Tensor, "d_vocab"]:
+        """
+        Applies a frequency penalty to the logits.
+        """
+        freq = t.bincount(input=input_ids, minlength=logits.size(0))
+        return logits - freq_penalty * freq
+
+
+    @staticmethod
+    def sample_basic(logits: Float[Tensor, "d_vocab"]) -> int:
+        """
+        Samples from the distribution defined by the logits.
+        """
+        sampled_token = t.distributions.categorical.Categorical(logits=logits).sample()
+        return sampled_token.item()
+
+    @staticmethod
+    def sample_top_k(logits: Float[Tensor, "d_vocab"], k: int) -> int:
+        """
+        Samples from the top k most likely tokens.
+        """
+        topk, indexes = logits.topk(k)
+        sampled_token_idx = t.distributions.categorical.Categorical(logits=topk).sample()
+        return indexes[sampled_token_idx].item()
+
+    @staticmethod
+    def sample_top_p(logits: Float[Tensor, "d_vocab"], top_p: float, min_tokens_to_keep: int = 1) -> int:
+        """
+        Samples from the most likely tokens which make up at least p cumulative probability.
+        """
+        raise NotImplementedError()
+
+    @t.inference_mode()
+    def beam_search(
+        self,
+        prompt: str,
+        num_return_sequences: int,
+        num_beams: int,
+        max_new_tokens: int,
+        no_repeat_ngram_size: int | None = None,
+    ) -> list[tuple[float, str]]:
+        """
+        Implements a beam search, by repeatedly performing the `generate` and `filter` steps (starting from the initial
+        prompt) until either of the two stopping criteria are met: (1) we've generated `max_new_tokens` tokens, or (2)
+        we've generated `num_returns_sequences` terminating sequences.
+        """
+        raise NotImplementedError()
+
+
+t.set_grad_enabled(False)  # gradients are not necessary for sampling
+
+model = DemoTransformer(Config()).to(device)
+model.load_state_dict(reference_gpt2.state_dict(), strict=False)
+tokenizer = reference_gpt2.tokenizer
+sampler = TransformerSampler(model, tokenizer)
+
+prompt = "Jingle bells, jingle bells, jingle all the way"
+print(f"Testing greedy decoding\nPrompt:   {prompt!r}")
+
+expected = "Jingle bells, jingle bells, jingle all the way up to the top of the mountain."
+output = sampler.sample(prompt, max_tokens_generated=8, temperature=0.0)
+
+print(f"Expected: {expected!r}\nActual:   {output!r}\n")
+assert output == expected
+
+print("Tests passed!")
+# %%
+prompt = "John and Mary went to the"
+input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+logits = model(input_ids)[0, -1]
+
+expected_top_5 = {" church": 0.0648, " house": 0.0367, " temple": 0.0145, " same": 0.0104, " Church": 0.0097}
+frequency_of_top_5 = defaultdict(int)
+
+N = 10_000
+for _ in tqdm(range(N)):
+    token = TransformerSampler.sample_next_token(input_ids.squeeze(), logits)
+    frequency_of_top_5[tokenizer.decode(token)] += 1
+
+for word in expected_top_5:
+    expected_freq = expected_top_5[word]
+    observed_freq = frequency_of_top_5[word] / N
+    print(f"Word: {word!r:<9}. Expected freq {expected_freq:.4f}, observed freq {observed_freq:.4f}")
+    assert abs(observed_freq - expected_freq) < 0.01, "Try increasing N if this fails by a small amount."
+
+print("Tests passed!")
+# %%
+bieber_prompt = "And I was like Baby, baby, baby, oh Like, Baby, baby, baby, no Like, Baby, baby, baby, oh I thought you'd always be mine, mine"
+input_ids = tokenizer.encode(bieber_prompt, return_tensors="pt")
+logits = t.ones(tokenizer.vocab_size)
+penalized_logits = TransformerSampler.apply_frequency_penalty(input_ids.squeeze(), logits, 2.0)
+
+assert penalized_logits[5156].item() == -11, "Expected 6 occurrences of ' baby' with leading space, 1-2*6=-11"
+assert penalized_logits[14801].item() == -5, "Expected 3 occurrences of ' Baby' with leading space, 1-2*3=-5"
+
+print("Tests passed!")
+# %%
+sampler = TransformerSampler(model, tokenizer)
+
+N_RUNS = 1
+your_prompt = "Jingle bells, jingle bells, jingle all the way"
+cases = [
+    ("High freq penalty", dict(frequency_penalty=100.0)),
+    ("Negative freq penalty", dict(frequency_penalty=-3.0)),
+    ("Too hot!", dict(temperature=2.0)),
+    ("Pleasantly cool", dict(temperature=0.7)),
+    ("Pleasantly warm", dict(temperature=0.9)),
+    ("Too cold!", dict(temperature=0.01)),
+]
+
+table = Table("Name", "Kwargs", "Output", title="Sampling - Manual Testing")
+
+for name, kwargs in cases:
+    for i in range(N_RUNS):
+        output = sampler.sample(your_prompt, max_tokens_generated=24, **kwargs)
+        table.add_row(name, str(kwargs), repr(output) + "\n")
+
+rprint(table)
+# %%
+prompt = "John and Mary went to the"
+input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+logits = model(input_ids)[0, -1]
+
+expected_top_5 = {" church": 0.0648, " house": 0.0367, " temple": 0.0145, " same": 0.0104, " Church": 0.0097}
+topk_5_sum = sum(expected_top_5.values())
+
+observed_freqs = defaultdict(int)
+
+N = 10000
+for _ in tqdm(range(N)):
+    token = TransformerSampler.sample_next_token(input_ids.squeeze(), logits, top_k=5)
+    observed_freqs[tokenizer.decode(token)] += 1
+
+for word in expected_top_5:
+    expected_freq = expected_top_5[word] / topk_5_sum
+    observed_freq = observed_freqs[word] / N
+    print(f"Word: {word!r:<9}. Expected freq = {expected_freq:.4f}, observed freq = {observed_freq:.4f}")
+    assert abs(observed_freq - expected_freq) < 0.01
 # %%
